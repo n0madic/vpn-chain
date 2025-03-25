@@ -1,0 +1,4 @@
+.ansible
+*.ini
+*.retry
+*.conf

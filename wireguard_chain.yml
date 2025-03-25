@@ -1,0 +1,225 @@
+---
+- name: Setup WireGuard VPN Chain
+  hosts: all
+  gather_facts: true
+  strategy: linear
+  become: true
+  vars:
+    wg_interface: wg0
+    wg_config_dir: /etc/wireguard
+    wg_config_file: "{{ wg_config_dir }}/{{ wg_interface }}.conf"
+    subnet_mask: 8
+    main_subnet: "10.0.0.0/{{ subnet_mask }}"
+    server_subnet_prefix: "10.100.0"
+    client_subnet: "10.200.0.0/24"
+    client_ip: "10.200.0.100/32"
+    routing_table: 200
+    client_config_file: "./vpn-chain.conf"
+    entry_server: ""
+    exit_server: ""
+
+  tasks:
+    # Determine available servers
+    - name: Configure VPN chain
+      run_once: true
+      delegate_to: localhost
+      delegate_facts: true
+      block:
+        - name: Build chain servers list
+          ansible.builtin.set_fact:
+            chain_servers: >-
+              {{
+                ([entry_server] if entry_server in ansible_play_hosts else [])
+                +
+                (ansible_play_hosts
+                  | difference([entry_server, exit_server] | select('ne', ''))
+                  | shuffle)
+                +
+                ([exit_server]
+                  if exit_server in ansible_play_hosts
+                     and exit_server != entry_server
+                  else [])
+              }}
+
+    - name: Share chain servers with all hosts
+      ansible.builtin.set_fact:
+        chain_servers: "{{ hostvars['localhost'].chain_servers }}"
+
+    # Install WireGuard
+    - name: Install WireGuard
+      ansible.builtin.apt:
+        name: wireguard
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create WireGuard directory
+      ansible.builtin.file:
+        path: "{{ wg_config_dir }}"
+        state: directory
+        mode: '0700'
+
+    # Generate keys and collect server info
+    - name: Generate keys and collect server information
+      block:
+        - name: Generate server private key
+          ansible.builtin.command: wg genkey
+          register: wg_private_key
+          no_log: true
+
+        - name: Generate server public key
+          ansible.builtin.shell: set -o pipefail && echo "{{ wg_private_key.stdout }}" | wg pubkey
+          args:
+            executable: /bin/bash
+          register: wg_public_key
+
+        - name: Register server information
+          ansible.builtin.set_fact:
+            server_info:
+              private_key: "{{ wg_private_key.stdout }}"
+              public_key: "{{ wg_public_key.stdout }}"
+              ip_address: "{{ inventory_hostname }}"
+              port: "{{ 60000 | random(start=10000) }}"
+
+    # Generate client keys once (only on the first server)
+    - name: Generate client keys
+      run_once: true
+      delegate_to: "{{ chain_servers[0] }}"
+      delegate_facts: true
+      block:
+        - name: Generate client private key
+          ansible.builtin.command: wg genkey
+          register: client_private_key_result
+          no_log: true
+
+        - name: Generate client public key
+          ansible.builtin.shell: set -o pipefail && echo "{{ client_private_key_result.stdout }}" | wg pubkey
+          args:
+            executable: /bin/bash
+          register: client_public_key_result
+
+        - name: Save client keys
+          ansible.builtin.set_fact:
+            client_keys:
+              private_key: "{{ client_private_key_result.stdout }}"
+              public_key: "{{ client_public_key_result.stdout }}"
+
+    # Collect all server information
+    - name: Collect all servers info
+      ansible.builtin.set_fact:
+        all_servers_info: "{{ dict(chain_servers | zip(chain_servers | map('extract', hostvars) | map(attribute='server_info')) | list) }}"
+      run_once: true
+      delegate_to: localhost
+      delegate_facts: true
+
+    # Determine server role and position
+    - name: Determine server role and position
+      ansible.builtin.set_fact:
+        server:
+          index: "{{ chain_servers.index(inventory_hostname) }}"
+          is_entry: "{{ inventory_hostname == chain_servers[0] }}"
+          is_exit: "{{ inventory_hostname == chain_servers[-1] }}"
+          is_intermediate: "{{ inventory_hostname != chain_servers[0] and inventory_hostname != chain_servers[-1] and chain_servers | length > 2 }}"
+          is_single: "{{ chain_servers | length == 1 }}"
+          chain_servers: "{{ chain_servers }}"
+          client_public_key: "{{ hostvars[chain_servers[0]]['client_keys']['public_key'] }}"
+          all_servers_info: "{{ hostvars['localhost']['all_servers_info'] }}"
+
+    # Stop WireGuard
+    - name: Stop WireGuard service
+      ansible.builtin.systemd:
+        name: wg-quick@{{ wg_interface }}
+        state: stopped
+        enabled: false
+
+    # Configure WireGuard
+    - name: Configure WireGuard server
+      ansible.builtin.copy:
+        content: |
+          # {{ inventory_hostname }} (
+          {%- if server.is_entry -%}entry
+          {%- elif server.is_exit -%}exit
+          {%- elif server.is_intermediate -%}intermediate
+          {%- endif %} server)
+          [Interface]
+          PrivateKey = {{ server_info.private_key }}
+          Address = {{ server_subnet_prefix }}.{{ server.index | int + 1 }}/{{ subnet_mask }}
+          ListenPort = {{ server_info.port }}
+          {% if not server.is_exit and not server.is_single %}
+          Table = {{ routing_table }}
+          {% endif %}
+
+          PostUp = sysctl -w net.ipv4.ip_forward=1
+          {% if server.is_entry or server.is_intermediate %}
+          PreUp = ip rule add from {{ client_subnet }} lookup {{ routing_table }}
+          PreDown = ip rule del from {{ client_subnet }} lookup {{ routing_table }} || true
+          {% endif %}
+
+          {% if server.is_exit or server.is_single %}
+          PostUp = iptables -t nat -A POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+          PostDown = iptables -t nat -D POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+          {% endif %}
+
+          {% if not server.is_entry and not server.is_single %}
+          {% set prev_server = server.chain_servers[server.index | int - 1] %}
+          {% set prev_info = server.all_servers_info[prev_server] %}
+          # {{ prev_server }} (Previous server in chain)
+          [Peer]
+          PublicKey = {{ prev_info.public_key }}
+          Endpoint = {{ prev_info.ip_address }}:{{ prev_info.port }}
+          AllowedIPs = {{ main_subnet }}
+          PersistentKeepalive = 25
+          {% endif %}
+
+          {% if not server.is_exit and not server.is_single %}
+          {% set next_server = server.chain_servers[server.index | int + 1] %}
+          {% set next_info = server.all_servers_info[next_server] %}
+          # {{ next_server }} (Next server in chain)
+          [Peer]
+          PublicKey = {{ next_info.public_key }}
+          Endpoint = {{ next_info.ip_address }}:{{ next_info.port }}
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = 25
+          {% endif %}
+
+          {% if server.is_entry or server.is_single %}
+          # Client
+          [Peer]
+          PublicKey = {{ server.client_public_key }}
+          AllowedIPs = {{ client_subnet }}
+          {% endif %}
+        dest: "{{ wg_config_file }}"
+        owner: root
+        group: root
+        mode: '0600'
+
+    # Start WireGuard
+    - name: Enable and start WireGuard service
+      ansible.builtin.systemd:
+        name: wg-quick@{{ wg_interface }}
+        enabled: true
+        state: started
+
+    # Generate client config
+    - name: Generate client configuration file
+      ansible.builtin.copy:
+        content: |
+          # WireGuard Client Configuration
+          [Interface]
+          PrivateKey = {{ hostvars[chain_servers[0]]['client_keys']['private_key'] }}
+          Address = {{ client_ip }}
+          DNS = 8.8.8.8, 1.1.1.1
+
+          # {{ chain_servers[0] }} (Entry Server)
+          [Peer]
+          PublicKey = {{ hostvars['localhost']['all_servers_info'][chain_servers[0]].public_key }}
+          AllowedIPs = 0.0.0.0/0
+          {% set entry_server = chain_servers[0] %}
+          {% set entry_info = hostvars['localhost']['all_servers_info'][entry_server] %}
+          Endpoint = {{ entry_info.ip_address }}:{{ entry_info.port }}
+          PersistentKeepalive = 25
+        dest: "{{ client_config_file }}"
+        mode: '0600'
+      delegate_to: localhost
+      run_once: true
+      become: false
