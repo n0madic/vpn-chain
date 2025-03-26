@@ -120,7 +120,6 @@
           is_entry: "{{ inventory_hostname == chain_servers[0] }}"
           is_exit: "{{ inventory_hostname == chain_servers[-1] }}"
           is_intermediate: "{{ inventory_hostname != chain_servers[0] and inventory_hostname != chain_servers[-1] and chain_servers | length > 2 }}"
-          is_single: "{{ chain_servers | length == 1 }}"
           chain_servers: "{{ chain_servers }}"
           client_public_key: "{{ hostvars[chain_servers[0]]['client_keys']['public_key'] }}"
           all_servers_info: "{{ hostvars['localhost']['all_servers_info'] }}"
@@ -145,22 +144,24 @@
           PrivateKey = {{ server_info.private_key }}
           Address = {{ server_subnet_prefix }}.{{ server.index | int + 1 }}/{{ subnet_mask }}
           ListenPort = {{ server_info.port }}
-          {% if not server.is_exit and not server.is_single %}
+          {% if not server.is_exit %}
           Table = {{ routing_table }}
           {% endif %}
 
           PostUp = sysctl -w net.ipv4.ip_forward=1
-          {% if server.is_entry or server.is_intermediate %}
+          PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
+          {% if not server.is_exit and (server.is_entry or server.is_intermediate) %}
           PreUp = ip rule add from {{ client_subnet }} lookup {{ routing_table }}
           PreDown = ip rule del from {{ client_subnet }} lookup {{ routing_table }} || true
           {% endif %}
 
-          {% if server.is_exit or server.is_single %}
-          PostUp = iptables -t nat -A POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
-          PostDown = iptables -t nat -D POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+          {% if server.is_exit %}
+          PostUp = iptables -t nat -A POSTROUTING -s {{ client_subnet }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+          PostDown = iptables -t nat -D POSTROUTING -s {{ client_subnet }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
           {% endif %}
 
-          {% if not server.is_entry and not server.is_single %}
+          {% if not server.is_entry %}
           {% set prev_server = server.chain_servers[server.index | int - 1] %}
           {% set prev_info = server.all_servers_info[prev_server] %}
           # {{ prev_server }} (Previous server in chain)
@@ -171,7 +172,7 @@
           PersistentKeepalive = 25
           {% endif %}
 
-          {% if not server.is_exit and not server.is_single %}
+          {% if not server.is_exit %}
           {% set next_server = server.chain_servers[server.index | int + 1] %}
           {% set next_info = server.all_servers_info[next_server] %}
           # {{ next_server }} (Next server in chain)
@@ -182,7 +183,7 @@
           PersistentKeepalive = 25
           {% endif %}
 
-          {% if server.is_entry or server.is_single %}
+          {% if server.is_entry %}
           # Client
           [Peer]
           PublicKey = {{ server.client_public_key }}
